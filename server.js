@@ -14,9 +14,7 @@ let accessTokenExpiresAt = 0;
 
 async function getAccessToken() {
   const now = Date.now();
-  if (accessToken && now < accessTokenExpiresAt) {
-    return accessToken;
-  }
+  if (accessToken && now < accessTokenExpiresAt) return accessToken;
 
   console.log("🔄 Refreshing eBay access token...");
 
@@ -46,16 +44,15 @@ async function getAccessToken() {
   });
 
   const data = await resp.json();
-
   if (!resp.ok || !data.access_token) {
-    console.error("❌ Failed to refresh token:", data);
+    console.error("❌ Failed to refresh:", data);
     throw new Error("Cannot refresh eBay access token");
   }
 
   accessToken = data.access_token;
-  accessTokenExpiresAt = now + (data.expires_in - 60) * 1000; // refresh 1m early
-  console.log("✅ New access token obtained");
+  accessTokenExpiresAt = now + (data.expires_in - 60) * 1000;
 
+  console.log("✅ New access token obtained");
   return accessToken;
 }
 
@@ -75,14 +72,12 @@ const MARKET_MAP = {
 };
 
 // =============================
-// SIMPLE IN-MEMORY CACHE
+// CACHE
 // =============================
-const cacheStore = new Map(); // key -> { value, expiresAt }
-
+const cacheStore = new Map();
 function setCache(key, value, ttlMs) {
   cacheStore.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
-
 function getCache(key) {
   const entry = cacheStore.get(key);
   if (!entry) return null;
@@ -94,21 +89,65 @@ function getCache(key) {
 }
 
 // =============================
-// HELPER: BROWSE SEARCH with CACHE
+// COMIC FILTERS
+// =============================
+const COMIC_CATEGORY_IDS = new Set(["63", "60252", "17076"]);
+
+const BLOCK_KEYWORDS = [
+  "sticker", "stickers", "decal", "magnet",
+  "trading card", "pokemon", "mtg", "yugioh",
+  "poster", "print", "t-shirt", "shirt", "hoodie",
+  "funko", "toy", "lego",
+  "mug", "cup", "pin", "patch",
+  "bundle", "lot", "set of",
+];
+
+function isLikelyComicItem(it) {
+  const title = (it.title || "").toLowerCase();
+
+  // buang kata negatif
+  if (BLOCK_KEYWORDS.some((k) => title.includes(k))) return false;
+
+  // cek kategori komik
+  const cats = it.categories || [];
+  if (cats.length > 0) {
+    const ids = cats.map((c) => String(c.categoryId));
+    if (!ids.some((id) => COMIC_CATEGORY_IDS.has(id))) return false;
+  }
+
+  // fallback: jika judul mengandung comic
+  if (
+    title.includes("comic") ||
+    title.includes("comics") ||
+    title.includes("tpb") ||
+    title.includes("trade paperback")
+  ) {
+    return true;
+  }
+
+  // kalau tanpa kategori dan tidak terlihat komik → buang
+  if (!cats.length) return false;
+
+  return true;
+}
+
+// =============================
+// BROWSE SEARCH (ONLY COMICS)
 // =============================
 async function callBrowseSearch({ q, country = "US", extraQuery = "" }) {
   const marketplace = MARKET_MAP[country.toUpperCase()] || "EBAY_US";
-  const key = `browse|${marketplace}|${q}|${extraQuery}`;
 
+  const key = `browse|${marketplace}|${q}|${extraQuery}`;
   const cached = getCache(key);
   if (cached) return cached;
 
   const token = await getAccessToken();
 
   const url =
-    `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(
-      q
-    )}` + extraQuery;
+    `https://api.ebay.com/buy/browse/v1/item_summary/search` +
+    `?q=${encodeURIComponent(q)}` +
+    `&category_ids=63` +            // <= FOKUS KE KOMIK
+    extraQuery;
 
   console.log("🌐 Fetching eBay:", url);
 
@@ -126,50 +165,44 @@ async function callBrowseSearch({ q, country = "US", extraQuery = "" }) {
     throw new Error(data.message || "eBay API error");
   }
 
-  // Cache 5 menit
   setCache(key, data, 5 * 60 * 1000);
   return data;
 }
 
 // =============================
-// HELPER: PRICE STATS
+// PRICE STATS
 // =============================
 async function getPriceStats({ q, country = "US", limit = 50 }) {
   const json = await callBrowseSearch({
     q,
     country,
-    extraQuery: `&limit=${encodeURIComponent(limit)}&sort=price`,
+    extraQuery: `&limit=${limit}&sort=price`,
   });
 
-  const items = json.itemSummaries || [];
+  const filtered = (json.itemSummaries || []).filter(isLikelyComicItem);
 
-  const prices = items
+  const prices = filtered
     .map((it) =>
-      it.price && it.price.value != null ? Number(it.price.value) : null
+      it.price?.value ? Number(it.price.value) : null
     )
     .filter((v) => !isNaN(v));
 
   if (!prices.length) {
-    return {
-      stats: null,
-      currency: "USD",
-      samples: [],
-    };
+    return { stats: null, currency: "USD", samples: [] };
   }
 
   const sorted = [...prices].sort((a, b) => a - b);
   const min = sorted[0];
   const max = sorted[sorted.length - 1];
-  const sum = sorted.reduce((acc, v) => acc + v, 0);
-  const avg = sum / sorted.length;
+  const avg = sorted.reduce((a, b) => a + b, 0) / sorted.length;
   const median =
-    sorted.length % 2 === 1
+    sorted.length % 2
       ? sorted[(sorted.length - 1) / 2]
       : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
 
-  const currency = items[0]?.price?.currency || "USD";
+  const currency = filtered[0].price.currency;
 
-  const samples = items.slice(0, 20).map((it) => ({
+  const samples = filtered.slice(0, 20).map((it) => ({
     itemId: it.itemId,
     title: it.title,
     price: it.price,
@@ -178,48 +211,39 @@ async function getPriceStats({ q, country = "US", limit = 50 }) {
     image: it.image?.imageUrl || null,
   }));
 
-  return {
-    stats: { min, max, avg, median, count: prices.length },
-    currency,
-    samples,
-  };
+  return { stats: { min, max, avg, median, count: prices.length }, currency, samples };
 }
 
 // =============================
-// PRICE HISTORY ENDPOINT
+// PRICE HISTORY
 // =============================
 app.get("/price-history", async (req, res) => {
   try {
     const { q, country = "US", limit = 50 } = req.query;
-
-    const { stats, currency, samples } = await getPriceStats({
-      q,
-      country,
-      limit: Number(limit) || 50,
-    });
+    const result = await getPriceStats({ q, country, limit: Number(limit) });
 
     res.json({
       query: q,
       country,
       marketplace: MARKET_MAP[country.toUpperCase()] || "EBAY_US",
-      currency,
-      stats,
-      samples,
+      currency: result.currency,
+      stats: result.stats,
+      samples: result.samples,
     });
   } catch (err) {
-    console.error("Error in /price-history:", err);
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // =============================
-// SIMPLE TRENDING (snapshot)
+// TRENDING
 // =============================
 app.get("/trending", async (req, res) => {
   try {
     const { country = "US" } = req.query;
 
-    const trendingTitles = [
+    const titles = [
       "Ultimate Fallout 4",
       "Amazing Spider-Man 300",
       "Incredible Hulk 181",
@@ -229,10 +253,10 @@ app.get("/trending", async (req, res) => {
 
     const results = [];
 
-    for (const title of trendingTitles) {
+    for (const t of titles) {
       try {
         const { stats, currency, samples } = await getPriceStats({
-          q: title,
+          q: t,
           country,
           limit: 40,
         });
@@ -240,33 +264,24 @@ app.get("/trending", async (req, res) => {
         if (!stats || !samples.length) continue;
 
         results.push({
-          title,
+          title: t,
           avgPrice: stats.avg,
           currency,
           sample: samples[0],
         });
-      } catch (e) {
-        console.warn("Trending title failed:", title, e.message);
-      }
+      } catch {}
     }
 
-    res.json({
-      country,
-      items: results,
-    });
+    res.json({ country, items: results });
   } catch (err) {
-    console.error("Error in /trending:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // =============================
-// MARKET MOVERS (DAY-TO-DAY CHANGE)
+// MARKET MOVERS (price delta)
 // =============================
-
-// store historical snapshots per (country + title)
 const marketHistory = new Map();
-// cache entire endpoint result for speed
 let marketMoversCache = null;
 let marketMoversCacheExpiresAt = 0;
 
@@ -274,70 +289,56 @@ app.get("/market-movers", async (req, res) => {
   try {
     const { country = "US" } = req.query;
 
-    // 1) endpoint-level cache (2 menit)
     const now = Date.now();
     if (marketMoversCache && now < marketMoversCacheExpiresAt) {
       return res.json(marketMoversCache);
     }
 
-    const titlesParam = req.query.titles; // optional ?titles=A,B,C
-    const moversTitles = titlesParam
-      ? String(titlesParam)
-          .split(",")
-          .map((s) => s.trim())
-          .filter((s) => s.isNotEmpty)
-      : [
-          "Ultimate Fallout 4",
-          "Amazing Spider-Man 300",
-          "Incredible Hulk 181",
-          "Giant-Size X-Men 1",
-          "Batman Adventures 12",
-        ];
+    const titles = [
+      "Ultimate Fallout 4",
+      "Amazing Spider-Man 300",
+      "Incredible Hulk 181",
+      "Giant-Size X-Men 1",
+      "Batman Adventures 12",
+    ];
 
     const movers = [];
 
-    for (const title of moversTitles) {
-      try {
-        const { stats, currency, samples } = await getPriceStats({
-          q: title,
-          country,
-          limit: 60,
-        });
+    for (const t of titles) {
+      const { stats, currency, samples } = await getPriceStats({
+        q: t,
+        country,
+        limit: 60,
+      });
 
-        if (!stats || !samples.length) continue;
+      if (!stats || !samples.length) continue;
 
-        const key = `${country}|${title.toLowerCase()}`;
-        const prev = marketHistory.get(key);
+      const key = `${country}|${t.toLowerCase()}`;
+      const prev = marketHistory.get(key);
 
-        let prevAvg = prev?.lastAvg ?? stats.avg;
-        let changeAbs = stats.avg - prevAvg;
-        let changePct = prevAvg > 0 ? (changeAbs / prevAvg) * 100 : 0;
+      let prevAvg = prev?.lastAvg ?? stats.avg;
+      let changeAbs = stats.avg - prevAvg;
+      let changePct = prevAvg ? (changeAbs / prevAvg) * 100 : 0;
 
-        // update history: shift lastAvg -> prevAvg
-        marketHistory.set(key, {
-          lastAvg: stats.avg,
-          prevAvg,
-          lastUpdated: now,
-        });
+      marketHistory.set(key, {
+        lastAvg: stats.avg,
+        prevAvg,
+        lastUpdated: now,
+      });
 
-        movers.push({
-          title,
-          country,
-          currency,
-          currentAvg: stats.avg,
-          previousAvg: prevAvg,
-          changeAbs,
-          changePct,
-          direction:
-            changeAbs > 0 ? "up" : changeAbs < 0 ? "down" : "flat",
-          sample: samples[0],
-        });
-      } catch (e) {
-        console.warn("Market mover fail:", title, e.message);
-      }
+      movers.push({
+        title: t,
+        currency,
+        country,
+        currentAvg: stats.avg,
+        previousAvg: prevAvg,
+        changeAbs,
+        changePct,
+        direction: changeAbs > 0 ? "up" : changeAbs < 0 ? "down" : "flat",
+        sample: samples[0],
+      });
     }
 
-    // Sort by biggest absolute percentage mover
     movers.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 
     const payload = {
@@ -346,13 +347,11 @@ app.get("/market-movers", async (req, res) => {
       items: movers,
     };
 
-    // set endpoint cache 2 menit
     marketMoversCache = payload;
     marketMoversCacheExpiresAt = now + 2 * 60 * 1000;
 
     res.json(payload);
   } catch (err) {
-    console.error("Error in /market-movers:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -361,16 +360,15 @@ app.get("/market-movers", async (req, res) => {
 // SOLD LISTINGS PLACEHOLDER
 // =============================
 app.get("/sold-listings", (req, res) => {
-  return res.status(501).json({
+  res.status(501).json({
     error: "sold_listings_not_available",
-    message:
-      "Sold listings require eBay Marketplace Insights API. Current app only uses Browse API.",
+    message: "Sold listings require Marketplace Insights API.",
   });
 });
 
 // ROOT
 app.get("/", (req, res) => {
-  res.send("Comic Value Backend is running with market-movers + caching.");
+  res.send("Comic Value Backend is running with comic-only filtering.");
 });
 
 app.listen(PORT, () => {
